@@ -1,0 +1,49 @@
+# === Core Dependencies ===
+torch>=2.0.0
+torchaudio>=2.0.0
+ffmpeg-python>=0.2.0
+openai-whisper>=20231117
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# === Gemini API ===
+google-genai>=0.5.0
+
+# === Jack Ensemble Model ===
+nest_asyncio>=1.5.0  # For async in already running event loops
+
+# === Audio Processing ===
+audioop-lts>=0.2.0  # Required for Python 3.13+ (audioop was removed in 3.13)
+                    # For Python 3.11/3.12, audioop is built-in and audioop-lts is NOT needed
+pydub>=0.25.0
+gTTS>=2.3.0
+pandas>=2.0.0
+
+# === TTS with Coqui XTTS (4 voice profiles) ===
+coqui-tts>=0.27.0
+numpy>=1.26.0
+hangul_romanize>=0.1.0  # Required for Korean TTS (한국어 로마자 변환)
+
+# === Audio Processing for Ducking (VAD-based volume control) ===
+pyloudnorm>=0.1.0
+scipy>=1.13.0
+librosa>=0.11.0  # Audio resampling for VAD (avoids torchcodec issues)
+soundfile>=0.12.0  # Audio file I/O (used by librosa and pydub)
+
+# === Notes ===
+# - Standard library modules (json, os, logging, typing) are built-in
+# - ffmpeg binary must be installed separately on the system (not via pip)
+#   - Windows: choco install ffmpeg or download from https://ffmpeg.org
+#   - Linux: apt install ffmpeg
+#   - macOS: brew install ffmpeg
+# - Silero VAD is loaded via torch.hub (no separate pip install needed)
+# 
+# IMPORTANT: Python Version Compatibility
+# - Python 3.11/3.12: audioop is built-in, audioop-lts NOT needed
+# - Python 3.13+: audioop was removed, install audioop-lts: pip install audioop-lts
+#
+# === TTS Voice Profiles ===
+# - kor_male: 한국어 남성 음성 (cut_5min_kor_male.mp3)
+# - kor_female: 한국어 여성 음성 (cut_5min_kor_female.mp3)
+# - eng_male: 영어 남성 음성 (cut_5min_eng_male.mp3)
+# - eng_female: 영어 여성 음성 (cut_5min_eng_female.mp3)

@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.*
+
+# Storage
+storage/
+uploads/
+ad_json/
+tts_output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+Cursor/server/.env
