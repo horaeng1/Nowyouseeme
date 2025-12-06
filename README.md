@@ -256,25 +256,329 @@ Cursor/python/
 
 ### 5.3 Jack 모델 (`get_AD_jack.py`)
 
-**Multi-stage Context Fusion 파이프라인**:
-1. **Stage 1**: 병렬 입력 생성 (Metadata, Core AD, STT)
-2. **Stage 2**: 최종 통합 (갭 채우기, 맥락 풍부화)
-3. **Stage 3**: 압축 (duration 기반 텍스트 길이 조절)
+**Multi-stage Context Fusion 파이프라인** - Gemini 3 Pro 기반 고품질 AD 생성
 
-```python
-# 특징
-- Gemini 3 Pro Preview 사용
-- 비동기 처리 (asyncio + ThreadPoolExecutor)
-- Thinking Mode 활성화 (thinking_budget=8192)
-- chars_per_sec: 한국어 7.0, 영어 15.0
+#### 처리 플로우
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Jack Method 파이프라인                      │
+└─────────────────────────────────────────────────────────────┘
+
+[Phase 1] 비디오 업로드
+    │
+    └──► Gemini Files API로 비디오 업로드
+         wait_for_file_active() → 파일 ACTIVE 상태 대기
+
+[Phase 2] 병렬 입력 생성 (asyncio.gather)
+    │
+    ├──► Metadata 추출 (PROMPT_METADATA)
+    │     • video_title, overall_summary
+    │     • scenes[]: scene_id, start/end_time
+    │     • characters[]: id, name, appearance, visible_emotion
+    │     • visible_actions[], relationships[], visual_focus
+    │
+    ├──► Core AD 생성 (PROMPT_AD)
+    │     • 무음 구간 탐지 (≥2.5초)
+    │     • 시각적 핵심 정보 묘사
+    │     • audio_descriptions[] 배열 생성
+    │
+    └──► STT 추출 (PROMPT_STT)
+          • full_transcript[]: time, speaker, text
+          • [Sound] 태그로 효과음 표시
+
+[Phase 3] 최종 통합 (Context Fusion)
+    │
+    └──► FINAL_PROMPT로 3개 결과 병합
+         • Metadata로 맥락 풍부화
+         • Core AD 누락 요소 보완
+         • STT 발화 참조 (짧은 감탄사 무시)
+         • 중복 제거, duration 내 문장 최적화
+
+[Phase 4] Stage 2 압축 (Compression)
+    │
+    └──► PROMPT_STAGE2로 텍스트 압축
+         • allowed_chars = duration_sec × chars_per_sec
+         • 핵심 시각 정보만 유지
+         • 한 항목당 한 문장
+
+         최종 출력: audio_descriptions[] (압축 완료)
 ```
 
-### 5.4 Cookie 모델 (`run_inference.py`)
+#### 프롬프트 구조
 
-- 별도 `inference` 폴더의 파이프라인 호출
-- Qwen-VL + Llama-70B 조합
-- HTTP 서버 통신 (포트 8001)
-- GPU 필요
+| 프롬프트 | 목적 | 주요 규칙 |
+|----------|------|-----------|
+| **PROMPT_METADATA** | 영상 메타데이터 추출 | 시각적 확인 가능 정보만, 추측 금지 |
+| **PROMPT_AD** | 무음 구간 Core AD | ≥2.5초 무음 탐지, 화면 정보만 묘사 |
+| **PROMPT_STT** | 대사/효과음 추출 | 화자별 대사, [Sound] 태그 |
+| **FINAL_PROMPT** | 3개 결과 통합 | 중복 제거, duration 내 문장 |
+| **PROMPT_STAGE2** | 텍스트 압축 | allowed_chars 제한, 한 문장 |
+
+#### 모델 설정
+
+```python
+# 모델
+GEMINI_MODEL_VISION = "gemini-3-pro-preview"  # 비전 분석용
+GEMINI_MODEL_TEXT = "gemini-3-pro-preview"    # 텍스트 처리용
+
+# API 호출 설정
+BASE_CONFIG = {
+    "temperature": 0,              # 결정적 출력
+    "top_k": 1,
+    "top_p": 0.00001,
+    "max_output_tokens": 65536,
+    "thinking_config": {
+        "thinking_budget": 8192    # Thinking Mode 활성화
+    },
+}
+
+# 압축 설정
+chars_per_sec_ko = 7.0   # 한국어: 초당 7자
+chars_per_sec_en = 15.0  # 영어: 초당 15자
+
+# 비동기 처리
+executor = ThreadPoolExecutor(max_workers=8)
+```
+
+#### 출력 형식
+
+```json
+{
+  "audio_descriptions": [
+    {
+      "id": 1,
+      "start_time": "0:03.5",
+      "end_time": "0:06.1",
+      "duration_sec": 2.6,
+      "description": "남자가 커피잔을 들어 한 모금 마신다.",
+      "allowed_chars": 18,
+      "current_chars_after": 17,
+      "compressed_by_chars": true,
+      "exceeds_limit": false
+    }
+  ]
+}
+```
+
+#### 에러 처리
+
+- **Gemini 재시도**: 3회 재시도, 5초 딜레이
+- **MAX_TOKENS 감지**: 토큰 소진 시 경고 로그
+- **JSON 복구**: `repair_json()`으로 잘린 JSON 자동 복구
+- **파일 정리**: 처리 완료 후 업로드 파일 자동 삭제
+
+### 5.4 GPT 모델 (`extract_for_gpt.py` + `get_AD_gpt.py`)
+
+**2단계 파이프라인 (프레임 추출 + Two-Pass AD 생성)**:
+
+#### Step 1: 데이터 추출 (`extract_for_gpt.py`)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   GPT 전처리 파이프라인                       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 오디오 추출 (FFmpeg)                                      │
+│    - 16kHz 모노 WAV로 변환                                   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. VAD 분석 (Silero VAD)                                    │
+│    - 발화 구간 탐지 (speech_timestamps)                      │
+│    - 무음 구간 계산 (min_silence_duration: 2.5초)            │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. STT (OpenAI Whisper)                                     │
+│    - 발화 구간별 텍스트 인식                                  │
+│    - 모델: tiny/base/small/medium/large                      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. 프레임 추출 (FFmpeg)                                      │
+│    - 2 FPS로 프레임 추출                                     │
+│    - 파일명: frame_0001_0.00s.jpg                            │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+         출력: {video_name}_data.json + frames/
+```
+
+#### Step 2: AD 생성 (`get_AD_gpt.py`)
+
+**Two-Pass 방식으로 고품질 AD 생성**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    1st Pass: 맥락 파악                       │
+├─────────────────────────────────────────────────────────────┤
+│ 입력: 15개 균등 샘플링 키프레임 + 전체 대본                    │
+│                                                             │
+│ 분석 항목:                                                   │
+│  • known_content: 알려진 영화/드라마 여부                     │
+│  • location: 장소/배경                                       │
+│  • characters: 등장인물 (남자1, 여자1 형식)                   │
+│  • situation: 상황 요약                                      │
+│  • mood: 분위기                                              │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│              긴 무음구간 분할 (Scene Split)                   │
+├─────────────────────────────────────────────────────────────┤
+│ • 16초 미만: 분할 없음                                       │
+│ • 16초 이상: 8초 단위 분할                                   │
+│   예: 23초 → [8초, 15초]                                     │
+│       30초 → [8초, 8초, 14초]                                │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    2nd Pass: AD 생성                         │
+├─────────────────────────────────────────────────────────────┤
+│ 각 무음 구간에 대해:                                         │
+│  • 해당 구간 프레임 (최대 10장) + 맥락 정보 전달              │
+│  • 이전 AD 텍스트 전달 → 중복 방지                           │
+│  • 전후 대사 컨텍스트 포함                                   │
+│                                                             │
+│ 규칙:                                                        │
+│  • duration 내 읽을 수 있는 길이                             │
+│  • 현재 시제, 객관적 묘사                                    │
+│  • 인물: 이름 X → "남자1", "여자1" 형식                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**GPT 모델 설정**:
+```python
+GPT_MODEL = "gpt-4o"
+max_tokens = 200 (AD), 500 (Context)
+temperature = 0.3
+image_detail = "low"  # 토큰 절약
+```
+
+### 5.5 Cookie 모델 (로컬 Inference 파이프라인)
+
+**Qwen-VL + Llama-70B 조합의 로컬 GPU 파이프라인**
+
+#### 아키텍처 개요
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   inference/ 폴더 구조                       │
+├─────────────────────────────────────────────────────────────┤
+│ main.py              ← 메인 파이프라인 엔트리포인트           │
+│ config.py            ← 설정 (VIDEO_PATH, MODEL_ID 등)        │
+│ inference_server.py  ← FastAPI HTTP 서버 (포트 8001)         │
+│                                                             │
+│ audio/               ← 오디오 처리 (Whisper)                 │
+│ vision/              ← Qwen-VL 모델 및 프레임 추출           │
+│ chunking/            ← 씬 기반 청크 분할                     │
+│ language/            ← Llama-70B 서사 생성                   │
+│ utils/               ← GPU 메모리 관리 등                    │
+│ output/              ← 결과 JSON 저장                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 처리 플로우
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Part A: 시각/청각 분석                    │
+│                    (Qwen-VL + Whisper)                       │
+└─────────────────────────────────────────────────────────────┘
+        │
+        ├──► 1. 오디오 추출 + Whisper STT
+        │       └→ dialogues 리스트 생성
+        │
+        ├──► 2. 씬 감지 (SigLIP)
+        │       └→ SCENE_THRESHOLD = 0.28
+        │
+        ├──► 3. 청크 생성
+        │       └→ MIN_CHUNK: 2초, MAX_CHUNK: 8초
+        │
+        ├──► 4. Qwen-VL 모델 로드
+        │       └→ unsloth/Qwen3-VL-8B-Instruct
+        │
+        └──► 5. 2-Stage Qwen-VL 추론
+                │
+                ├── Stage 1: 인물 식별
+                │   └→ "Person 1: Body/Face, Attire..."
+                │
+                └── Stage 2-A: 행동 분석 (인물 있을 때)
+                    Stage 2-B: 배경 분석 (인물 없을 때)
+
+                출력: final_ad_creation_output.json
+
+        ⬇ GPU 메모리 해제 (Qwen 언로드)
+
+┌─────────────────────────────────────────────────────────────┐
+│                    Part B: 서사 생성                         │
+│                    (Llama-3.1-70B)                           │
+└─────────────────────────────────────────────────────────────┘
+        │
+        ├──► [Stage 1] 서사 생성 (Narrative Generation)
+        │       └→ 청크별 AD 텍스트 초안 생성
+        │       └→ stage1_narrative_output.json
+        │
+        ├──► [Stage 2] 기억 추적 (Memory Tracker)
+        │       └→ 인물 일관성 유지 (동일인물 추적)
+        │       └→ stage2_final_output.json
+        │
+        └──► [Stage 3] 서사 다듬기 (Refinement)
+                └→ 중복 제거, 길이 조절
+                └→ stage3_final_narrative_refined.json
+
+        ⬇ GPU 메모리 해제 (Llama 언로드)
+
+                최종 출력: stage3_final_narrative_refined.json
+```
+
+#### HTTP 서버 API (`inference_server.py`)
+
+```http
+# 서버 시작
+cd /mnt/Ko-AD/inference
+source venv/bin/activate
+uvicorn inference_server:app --host 0.0.0.0 --port 8001
+```
+
+**엔드포인트**:
+```http
+GET  /health              # GPU 상태 확인
+POST /generate-ad         # AD 생성 요청
+
+# 요청 예시
+{
+  "video_path": "/path/to/video.mp4",
+  "output_dir": "/path/to/output",
+  "lang": "ko",          // "ko" 또는 "en"
+  "video_id": "uuid-xxx"
+}
+```
+
+**모델 설정**:
+```python
+# config.py
+QWEN_MODEL = "unsloth/Qwen3-VL-8B-Instruct"    # 비전 모델
+LLAMA_MODEL = "unsloth/Meta-Llama-3.1-70B-Instruct-bnb-4bit"  # 언어 모델
+SIGLIP_MODEL = "google/siglip-large-patch16-384"  # 씬 감지
+
+# 파라미터
+SCENE_THRESHOLD = 0.28    # 씬 변화 감지 임계값
+MIN_CHUNK_LEN = 2.0       # 최소 청크 길이 (초)
+MAX_CHUNK_LEN = 8.0       # 최대 청크 길이 (초)
+```
+
+**요구 사항**:
+- NVIDIA GPU (VRAM 24GB+ 권장, RTX 4090 등)
+- CUDA 12.x
+- 별도 venv 환경 (`inference/venv/`)
 
 ---
 
